@@ -1,0 +1,169 @@
+#!/opt/chef/embedded/bin/ruby
+################################################################################################
+# This script collects expired tcwireless cert counts and will be displayed on a DataDog Dashboarc
+#
+# Author: Jeremy Hill
+# Date: 05 NOV 2015
+################################################################################################
+################################################################################################
+require 'tiny_tds'
+require 'rubygems'
+require 'json'
+require 'open-uri'
+require 'net/http'
+require 'io/console'
+require 'openssl'
+require 'date'
+require 'logger'
+require 'yaml'
+require_relative '/opt/toc/common/datadog_api'
+require 'httparty'
+require 'time'
+require 'hashie'
+
+# Log Init ################################################
+@log_file = '/opt/toc/stores_scripts/logs/stores_expired_ios_cert_count.log'
+@log = Logger.new(@log_file, 10, 1024000)
+@log.datetime_format = '%Y-%m-%d %H:%M:%S'
+@client_connected = false
+@cert_issue_tracker  = []
+@cert_issue_count    = 0
+@cert_issue_log      = '/opt/toc/stores_scripts/config/cert_issues_log'
+@dd_alert_name  = 'Stores expired iOS cert count'         # alert_name
+@dd_alert_title = 'Stores.expired.ios.cert.count'         # alert_title searched for in dd
+@debug_script = false # This is to turn on/off DataDog uploads & print to screen (true = DD off & print to screen on)
+##### API Setup to DataDog #####
+@dd = DataDogAPI.new("<%= node['toc_dashboards']['datadog_api_key'] %>",
+                     @log_file, 'stores_expired_ios_cert_count_logfile',
+                     "<%= node['toc_dashboards']['web_proxy_host'] %>",
+                     "<%= node['toc_dashboards']['web_proxy_port'] %>",
+                     "<%= node['toc_dashboards']['datadog_application_key'] %>")
+################################################################################################
+# Function to log information #############################
+def log_out(entry)
+  @log.info(entry)
+end
+
+def check_history_and_event(storenumber, certcount)
+  puts "CH storenumber: #{storenumber}"
+  puts "CH certcount: #{certcount}"
+  bol_found_previous = false
+  log_out('Trying to determine if this store and certcount are a previously captured issue.')
+  @previous_cert_issue.each do |prev_cert|
+    puts "loop #{prev_cert}"
+    bol_found_previous = true if prev_cert == "#{storenumber},#{certcount}"
+  end
+  return unless bol_found_previous == false
+  if @debug_script == true
+    puts '-------------------------------'
+    puts 'stores_wireless_expired_certs'
+    puts 'Stores wireless expired cert'
+    puts 'Stores.wireless.expired.cert'
+    puts 'Error'
+    puts "Store number T#{storenumber} has #{certcount} expired tcwireless certificates
+     http://s.target.com/content/reporting/#/overview/#{storenumber}"
+    puts '################################'
+  else
+    #Submission to DataDog
+    @dd.alert_datadog(
+      'stores_wireless_expired_certs',                           # tag
+      'Stores wireless Expired Cert',                            # alert_name
+      'Stores.wireless.expired.cert',                            # alert_title searched for in dd
+      "Store number T#{storenumber} has #{certcount} expired tcwireless certificates
+       http://s.target.com/content/reporting/#/overview/#{storenumber}",                # alert_text
+      'Error',                                                                          # alert_type
+      'event',                                                                          # api type
+      '')                                                                               # counter
+  end
+end
+
+def track_and_clear_cert_issues(cert_issue)
+  # Store current list of Cert issues into stateful file
+  puts "Previous cert List: #{@previous_cert_issue}" if @debug_script == true
+  puts "Current cert List: #{cert_issue}" if @debug_script == true
+  puts "Count #{@cert_issue_count}" if @debug_script == true
+  File.open(@cert_issue_log, 'w+') do |f|
+    f.puts(cert_issue)
+  end
+  #Send all Clear message to datadog when Store and Cert count falls off the list
+  @previous_cert_issue.each do |prev_cert|
+    bol_found = false
+    @cert_issue_tracker.each do |curr_cert|
+      if prev_cert == curr_cert
+        puts "Prev Cert: #{prev_cert}"
+        puts "Curr Cert: #{curr_cert}"
+        bol_found = true
+      end
+    end
+    puts "State of #{prev_cert}, Found? #{bol_found}"
+    puts '______________________________'
+    next unless bol_found == false
+    store_monitor = prev_cert.split(',')
+    hashtags = ['stores_wireless_expired_certs']
+    dd_alert_text   = "recovered. Store number T#{store_monitor[0]} has <2 expired tcwireless certificates"
+    dd_alert_type   = 'success'
+    dd_api_type     = 'event'
+    if @debug_script == true
+      puts '-------------------------------'
+      puts "Hashtags: #{hashtags}"
+      puts "Alert Name: #{@dd_alert_name}"
+      puts "Alert Title: #{@dd_alert_title}"
+      puts "Alert Type: #{dd_alert_type}"
+      puts "Alert Text: #{dd_alert_text}"
+      puts "Count #{@cert_issue_count}"
+      puts '################################'
+    else
+      #Submission to DataDog
+      @dd.alert_datadog(
+        hashtags,               # tag
+        "#{@dd_alert_name}",    # alert_name
+        "#{@dd_alert_title}",   # alert_title searched for in dd
+        "#{dd_alert_text}",     # alert_text
+        "#{dd_alert_type}",     # alert_type
+        "#{dd_api_type}",       # api type
+        '')                     # counter
+    end
+  end
+end
+
+def generate_output(final_list)
+  csv = []
+  final_list.each do |detail|
+    storenumber = "#{detail['id']}"
+    certcount = "#{detail['expiredCertsCount']}"
+    if detail['expiredCertsCount'] >= 2
+      @cert_issue_count += 1
+      @cert_issue_tracker.push(storenumber + ',' + certcount) #Need to hold the info for stateful storage
+      csv << "#{storenumber},#{certcount}"
+      check_history_and_event(storenumber, certcount)
+      puts "Count: #{@cert_issue_count}"
+    else
+      next
+    end
+  end
+end
+# Expired wireless cert query from Airwatch
+response = HTTParty.get('http://s.target.com/DeviceManagement/store/v1/all',
+                        verify: false)
+begin
+          @previous_cert_issue = []
+          log_out('Importing stateful data from logfile')
+          if File.exist?(@cert_issue_log)
+            puts 'Reading Previous Log'
+            f = File.open(@cert_issue_log, 'r')
+            f.each_line do |line|
+              @previous_cert_issue.push(line.chomp)
+            end
+            f.close
+            puts "cert issu log: #{@cert_issue_log}"
+            puts "previous cert issue: #{@previous_cert_issue}"
+            log_out('Deleting previous stateful tracking info')
+            File.delete(@cert_issue_log)
+          end
+        rescue => e
+          log_out("Errored on handling stateful information : #{e}")
+        end
+generate_output(response)
+track_and_clear_cert_issues(@cert_issue_tracker)
+
+@dd.send_metric("stores.wireless.expired.cert.count", "#{@cert_issue_count}", '')

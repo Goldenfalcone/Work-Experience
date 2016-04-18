@@ -1,0 +1,279 @@
+#!/opt/chef/embedded/bin/ruby
+################################################################################################
+# This script collects iOS device usage counts from airwatch and splunk and will be displayed on a DataDog Dashboarc
+#
+# Author: Jeremy Hill
+# Date: 06 NOV 2015
+################################################################################################
+################################################################################################
+require 'tiny_tds'
+require 'rubygems'
+require 'json'
+require 'open-uri'
+require 'net/http'
+require 'io/console'
+require 'openssl'
+require 'date'
+require 'logger'
+require 'yaml'
+require_relative '/opt/toc/common/datadog_api'
+require_relative '/opt/toc/common/splunk_search'
+require 'httparty'
+require 'time'
+require 'hashie'
+
+# Log Init ################################################
+@log_file = '/opt/toc/stores_scripts/logs/stores_mydevice_usage_count.log'
+@log = Logger.new(@log_file, 10, 1024000)
+@log.datetime_format = '%Y-%m-%d %H:%M:%S'
+@client_connected = false
+@debug_script = false # This is to turn on/off DataDog uploads & print to screen (true = DD off & print to screen on)
+##### API Setup to DataDog #####
+@dd = DataDogAPI.new("<%= node['toc_dashboards']['datadog_api_key'] %>",
+                     @log_file, 'stores_mydevcie_usage_count_logfile',
+                     "<%= node['toc_dashboards']['web_proxy_host'] %>",
+                     "<%= node['toc_dashboards']['web_proxy_port'] %>",
+                     "<%= node['toc_dashboards']['datadog_application_key'] %>")
+################################################################################################
+def log_out(entry)
+  @log.info(entry)
+end
+#create splunk connection
+splunk_init = SplunkSearch.new('<%= @login_file %>', @log_file)
+
+log_out('successfully created splunk instance')
+
+#search splunk using the saved search
+results = splunk_init.splunk_search("<%= node['stores_dashboards']['splunk_server'] %>", "<%= node['stores_dashboards']['splunk_port'] %>", 'stores_splunk_user', 'stores_splunk_pass',
+                                    "<%= node['stores_dashboards']['stores_splunk_namespace'] %>", 'MyDevice Unique Device Used Count')
+
+results.each do |result|
+  splk_result = result['dc(deviceId)']
+  #if the Splunk Search class returned
+  if results == 'error'
+    #error returned by splunk as a string, post to datadog and exit
+    log_out("error connecting to Splunk: #{splunk_init}")
+    puts 'error about to exit'
+
+    #check if running in a dev environment
+    host = `hostname`
+    post_to_datadog = "<%= node['stores_dashboards']['post_to_datadog'] %>"
+    if post_to_datadog == 'false'
+      puts "Not submitting to DD since I'm not a real box, I'm just #{host}"
+      exit 1
+      dd.alert_datadog('splunk_api', 'Splunk APIs', "Splunk Search Failed on #{host}", "Error Connecting to Splunk for My Decice Unique Device Used Count on #{host}")
+      exit 1
+      if @debug_script == true
+        #puts "Splunk Count: #{result['dc(deviceId)']}"
+      else
+        @dd.alert_datadog(
+          '',                                      # tag
+          'myWork Usage Count Splunk',             # alert_name
+          'Stores.mywork.usage.count.splunk',      # alert_title searched for in dd
+          'used for metrics',                      # alert_text
+          'info',                                  # alert_type
+          'metric',                                # api type
+          result['dc(deviceId)'])                  # counter
+      end
+    end
+  end
+  # Expired wireless cert query from Airwatch
+  myd_allocated_total = 0
+  myd_active_total = 0
+  grs_allocated_total = 0
+  grs_active_total = 0
+  grk_allocated_total = 0
+  grk_active_total = 0
+  cl_allocated_total = 0
+  cl_active_total = 0
+  deli_allocated_total = 0
+  deli_active_total = 0
+  ff_allocated_total = 0
+  ff_active_total = 0
+  response = HTTParty.get('http://s.target.com/DeviceManagement/store/v1/all',
+                          verify: false)
+  response.each do |detail|
+    myd_allocated_count = detail['allocation']['myd:ipod']
+    myd_active_count = detail['activeCounts']['myd:ipod']
+    grs_allocated_count = detail['allocation']['gr:ipod']
+    grs_active_count = detail['activeCounts']['gr:ipod']
+    grk_allocated_count = detail['allocation']['gr:ipad']
+    grk_active_count = detail['activeCounts']['gr:ipad']
+    cl_allocated_count = detail['allocation']['clinic:ipad']
+    cl_active_count = detail['activeCounts']['clinic:ipad']
+    deli_allocated_count = detail['allocation']['deli:ipod']
+    deli_active_count = detail['activeCounts']['deli:ipod']
+    ff_allocated_count = detail['allocation']['ff:ipad']
+    ff_active_count = detail['activeCounts']['ff:ipad']
+    myd_allocated_total += myd_allocated_count
+    myd_active_total += myd_active_count
+    unless detail['allocation']['ff:ipad'].nil?
+      ff_allocated_total += ff_allocated_count
+    end
+    unless detail['activeCounts']['ff:ipad'].nil?
+      ff_active_total += ff_active_count
+    end
+    unless detail['allocation']['gr:ipod'].nil?
+      grs_allocated_total += grs_allocated_count
+    end
+    unless detail['activeCounts']['gr:ipod'].nil?
+      grs_active_total += grs_active_count
+    end
+    unless detail['allocation']['gr:ipad'].nil?
+      grk_allocated_total += grk_allocated_count
+    end
+    unless detail['activeCounts']['gr:ipad'].nil?
+      grk_active_total += grk_active_count
+    end
+    unless detail['allocation']['clinic:ipad'].nil?
+      cl_allocated_total += cl_allocated_count
+    end
+    unless detail['activeCounts']['clinic:ipad'].nil?
+      cl_active_total += cl_active_count
+    end
+    unless detail['allocation']['deli:ipod'].nil?
+      deli_allocated_total += deli_allocated_count
+    end
+    unless detail['activeCounts']['deli:ipod'].nil?
+      deli_active_total += deli_active_count
+    end
+  end
+  aw_myd_usagepercent = myd_active_total * 100 / myd_allocated_total
+  splk_myd_usagepercent = splk_result.to_i * 100 / myd_active_total
+  grs_usagepercent = grs_active_total * 100 / grs_allocated_total
+  grk_usagepercent = grk_active_total * 100 / grk_allocated_total
+  if @debug_script == true
+    #puts "Detail: #{detail}"
+    puts '------------------------------'
+    puts "myDevice Allocated Total: #{myd_allocated_total}"
+    puts "myDevice Active Total: #{myd_active_total}"
+    puts "GR Scanner allocated total: #{grs_allocated_total}"
+    puts "GR Scanner active Total: #{grs_active_total}"
+    puts "GR Kiosk allocated total: #{grk_allocated_total}"
+    puts "GR Kiosk active total: #{grk_active_total}"
+    puts "Splunk myDevice Active Count: #{result['dc(deviceId)']}"
+    puts "AirWatch myDevice usage percent: #{aw_myd_usagepercent}%"
+    puts "Splunk myWork usage percent: #{splk_myd_usagepercent}%"
+    puts "Airwatch GR Scanner usage percent: #{grs_usagepercent}%"
+    puts "Airwatch GR Kiosk usage percent: #{grk_usagepercent}%"
+    puts "Clinic allocated Count: #{cl_allocated_total}"
+    puts "Clinic active count: #{cl_active_total}"
+    puts "Deli Allocated Count: #{deli_allocated_total}"
+    puts "Deli Active Count: #{deli_active_total}"
+    puts "FF Allocated Count: #{ff_allocated_total}"
+    puts "FF active count: #{ff_active_total}"
+  else
+    @dd.alert_datadog(
+      '',                                            # tag
+      'myDevice Usage percent AirWatch',             # alert_name
+      'Stores.mydevice.usage.percent.airwatch',      # alert_title searched for in dd
+      'used for metrics',                            # alert_text
+      'info',                                        # alert_type
+      'metric',                                      # api type
+      aw_myd_usagepercent)                           # Counter
+    @dd.alert_datadog(
+      '',                                            # tag
+      'FF iPad active count AirWatch',               # alert_name
+      'Stores.ff.ipad.active.count.airwatch',        # alert_title searched for in dd
+      'used for metrics',                            # alert_text
+      'info',                                        # alert_type
+      'metric',                                      # api type
+      ff_active_total)                               # counter
+    @dd.alert_datadog(
+      '',                                            # tag
+      'FF iPad allocated count AirWatch',            # alert_name
+      'Stores.ff.ipad.allocated.count.airwatch',     # alert_title searched for in dd
+      'used for metrics',                            # alert_text
+      'info',                                        # alert_type
+      'metric',                                      # api type
+      ff_allocated_total)                            # counter
+    @dd.alert_datadog(
+      '',                                            # tag
+      'Deli Active Count AirWatch',                  # alert_name
+      'Stores.deli.active.count.airwatch',           # alert_title searched for in dd
+      'used for metrics',                            # alert_text
+      'info',                                        # alert_type
+      'metric',                                      # api type
+      deli_active_total)                             # counter
+    @dd.alert_datadog(
+      '',                                            # tag
+      'Deli allocated count AirWatch',               # alert_name
+      'Stores.deli.allocated.count.airwatch',        # alert_title searched for in dd
+      'used for metrics',                            # alert_text
+      'info',                                        # alert_type
+      'metric',                                      # api type
+      deli_allocated_total)                          # counter
+    @dd.alert_datadog(
+      '',                                            # tag
+      'Clinic Active Count AirWatch',                # alert_name
+      'Stores.clinic.active.count.airwatch',         # alert_title searched for in dd
+      'used for metrics',                            # alert_text
+      'info',                                        # alert_type
+      'metric',                                      # api type
+      cl_active_total)                               # counter
+    @dd.alert_datadog(
+      '',                                            # tag
+      'Clinic Allocated Count AirWatch',             # alert_name
+      'Stores.clinic.allocated.count.airwatch',      # alert_title searched for in dd
+      'used for metrics',                            # alert_text
+      'info',                                        # alert_type
+      'metric',                                      # api type
+      cl_allocated_total)                            # counter
+    @dd.alert_datadog(
+      '',                                          # tag
+      'myDevice Usage percent Splunk',             # alert_name
+      'Stores.mydevice.usage.percent.splunk',      # alert_title searched for in dd
+      'used for metrics',                          # alert_text
+      'info',                                      # alert_type
+      'metric',                                    # api type
+      splk_myd_usagepercent)                       # counter
+    @dd.alert_datadog(
+      '',                                              # tag
+      'myDevice Allocated Count AirWatch',             # alert_name
+      'Stores.mydevice.allocated.count.airwatch',      # alert_title searched for in dd
+      'used for metrics',                              # alert_text
+      'info',                                          # alert_type
+      'metric',                                        # api type
+      myd_allocated_total)                             # counter
+    @dd.alert_datadog(
+      '',                                           # tag
+      'myDevice Active Count AirWatch',             # alert_name
+      'Stores.mydevice.active.count.airwatch',      # alert_title searched for in dd
+      'used for metrics',                           # alert_text
+      'info',                                       # alert_type
+      'metric',                                     # api type
+      myd_active_total)                             # counter
+    @dd.alert_datadog(
+      '',                                                # tag
+      'GR Scanner Allocated Count AirWatch',             # alert_name
+      'Stores.gr.scanner.allocated.count.airwatch',      # alert_title searched for in dd
+      'used for metrics',                                # alert_text
+      'info',                                            # alert_type
+      'metric',                                          # api type
+      grs_allocated_total)                               # counter
+    @dd.alert_datadog(
+      '',                                             # tag
+      'GR Scanner Active Count AirWatch',             # alert_name
+      'Stores.gr.scanner.active.count.airwatch',      # alert_title searched for in dd
+      'used for metrics',                             # alert_text
+      'info',                                         # alert_type
+      'metric',                                       # api type
+      grs_active_total)                               # counter
+    @dd.alert_datadog(
+      '',                                              # tag
+      'GR Kiosk Allocated Count AirWatch',             # alert_name
+      'Stores.gr.kiosk.allocated.count.airwatch',      # alert_title searched for in dd
+      'used for metrics',                              # alert_text
+      'info',                                          # alert_type
+      'metric',                                        # api type
+      grk_allocated_total)                             # counter
+    @dd.alert_datadog(
+      '',                                           # tag
+      'GR Kiosk Active Count AirWatch',             # alert_name
+      'Stores.gr.kiosk.active.count.airwatch',      # alert_title searched for in dd
+      'used for metrics',                           # alert_text
+      'info',                                       # alert_type
+      'metric',                                     # api type
+      grk_active_total)                             # counter
+  end
+end

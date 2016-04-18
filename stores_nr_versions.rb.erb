@@ -1,0 +1,115 @@
+#!/opt/chef/embedded/bin/ruby
+################################################################################################
+# This script collects the myWork version and iOS versions from New Relic and will be displayed on a DataDog Dashboarc
+#
+# Author: Jeremy Hill
+# Date: 03 NOV 2015
+################################################################################################
+################################################################################################
+require 'tiny_tds'
+require 'rubygems'
+require 'json'
+require 'open-uri'
+require 'net/http'
+require 'io/console'
+require 'openssl'
+require 'date'
+require 'logger'
+require 'yaml'
+require_relative '/opt/toc/common/datadog_api'
+require 'httparty'
+require 'time'
+require 'hashie'
+
+# Log Init ################################################
+@log_file = '/opt/toc/stores_scripts/logs/stores_nr_versions.log'
+@log = Logger.new(@log_file, 10, 1024000)
+@log.datetime_format = '%Y-%m-%d %H:%M:%S'
+@client_connected = false
+@dd_alert_name  = 'Stores myDevice iOS Version'         # alert_name
+@dd_alert_title = 'Stores.myDevice.iOS.Version'         # alert_title searched for in dd
+@dd_alert_name2  = 'Stores myWork app Version'         # alert_name
+@dd_alert_title2 = 'Stores.myWork.app.Version'         # alert_title searched for in dd
+@debug_script = false # This is to turn on/off DataDog uploads & print to screen (true = DD off & print to screen on)
+##### API Setup to DataDog #####
+@dd = DataDogAPI.new("<%= node['toc_dashboards']['datadog_api_key'] %>",
+                     @log_file, 'stores_nr_versions_logfile',
+                     "<%= node['toc_dashboards']['web_proxy_host'] %>",
+                     "<%= node['toc_dashboards']['web_proxy_port'] %>",
+                     "<%= node['toc_dashboards']['datadog_application_key'] %>")
+################################################################################################
+# Function to log information #############################
+def log_out(entry)
+  @log.info(entry)
+end
+# Mywork iOS version from newrelic query
+response_osv = HTTParty.get('https://insights-api.newrelic.com/v1/accounts/892034/query?',
+                            headers: { 'X-Query-Key' => "<%= node['toc_dashboards']['x_query_key'] %>" },
+                            query: 'nrql=SELECT%20uniquecount%28uuid%29%20from%20Mobile%20where%20appName%20%3D%27Stores%2emyWork%27%20facet%20osVersion',
+                            verify: false)
+
+#This splits the hash array for Facets
+response = response_osv.parsed_response['facets']
+#Splits one more time for iOS version
+response.each do |detail|
+  #Splits again for final numbers
+  detail['results'].each do |zoom|
+    if @debug_script == true
+      puts "iOS Version: #{detail['name']}"
+      puts "Count: #{zoom['uniqueCount']}"
+      puts '-------------------------------'
+      #puts "Hashtags: #{hashtags}"
+      puts "Alert Name: #{@dd_alert_name}"
+      puts "Alert Title: #{@dd_alert_title}"
+      #puts "Alert Type: #{dd_alert_type}"
+      #puts "Alert Text: #{dd_alert_text}"
+      puts '################################'
+    else
+      #Submission to DataDog Have to flip version name with count to post correctly to datadog
+      @dd.alert_datadog(
+        "ios_version:#{zoom['uniqueCount']}",                           # tag
+        "#{@dd_alert_name}",                            # alert_name
+        "#{@dd_alert_title}",         # alert_title searched for in dd
+        'Used for metrics',                             # alert_text
+        'Info',                                         # alert_type
+        'metric',                                       # api type
+        "#{detail['name']}")                       # counter
+    end
+  end
+end
+# MyWork App version from newrelic
+response_mwv = HTTParty.get('https://insights-api.newrelic.com/v1/accounts/892034/query?',
+                            headers: { 'X-Query-Key' => "<%= node['toc_dashboards']['x_query_key'] %>" },
+                            query: 'nrql=SELECT%20uniquecount%28uuid%29%20from%20Mobile%20where%20appName%20%3D%27Stores%2emyWork%27%20facet%20appVersion',
+                            verify: false)
+response = response_mwv.parsed_response['facets']
+response.each do |detail|
+  detail['results'].each do |zoom|
+    if @debug_script == true
+      puts "myWork Version: #{detail['name']}"
+      puts "Count: #{zoom['uniqueCount']}"
+      puts '-------------------------------'
+      #puts "Hashtags: #{hashtags}"
+      puts "Alert Name: #{@dd_alert_name2}"
+      puts "Alert Title: #{@dd_alert_title2}"
+      #puts "Alert Type: #{dd_alert_type}"
+      #puts "Alert Text: #{dd_alert_text}"
+      puts '################################'
+      puts "Count: #{zoom['uniqueCount']}"
+      puts "Name: #{detail['name'].sub!(/^0./, "")}"
+    else
+
+      #Submission to DataDog have to flip count with version number to post correctly in DD
+      @dd.alert_datadog(
+        "app_version:#{zoom['uniqueCount']}",             # tag
+        "#{@dd_alert_name2}",                             # alert_name
+        "#{@dd_alert_title2}",                            # alert_title searched for in dd
+        'Used for metrics',                               # alert_text
+        'Info',                                           # alert_type
+        'metric',                                         # api type
+        "#{detail['name'].sub!(/^0./, "")}")                              # counter
+    end
+  end
+end
+
+log_out('Finished NR mywork ios and app version')

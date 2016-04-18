@@ -1,0 +1,300 @@
+#!/opt/chef/embedded/bin/ruby
+=begin
+################################################################################################
+URL health events from SCOM
+Written by: Jeremy Hill2
+################################################################################################
+=end
+# Inclusions/Requires
+require 'tiny_tds'
+require 'rubygems'
+require 'json'
+require 'open-uri'
+require 'net/http'
+require 'io/console'
+require 'openssl'
+require 'date'
+require 'logger'
+require 'yaml'
+require_relative '/opt/toc/common/datadog_api'
+
+################################################################################################
+# Global Variables
+################################################################################################
+@log_file               = "<%= node['stores_dashboards']['scom_stores_url_logfile'] %>"
+@log                    = Logger.new(@log_file, 10, 1024000)
+@log.datetime_format    = '%Y-%m-%d %H:%M:%S'
+@isp_svc_issue_tracker  = []
+@isp_svc_issue_count    = 0
+@isp_svc_log            = '/opt/toc/stores_scripts/config/isp_svc_issues_log'
+@dd_alert_name          = 'Stores ISP SCOM Unhealthy URL'                       # alert_name
+@dd_alert_title         = 'Stores.ISP.SCOM.Unhealthy.URL'                       # alert_title searched for in dd
+def log_out(entry)
+  @log.info(entry)
+end
+
+##### Load login credentials from file #####
+if File.exist? "<%= node['stores_dashboards']['login_file'] %>"
+  config = YAML.load_file("<%= node['stores_dashboards']['login_file'] %>")
+  scom_stores_warehouse_user = config['stores_scom_user']
+  scom_stores_warehouse_pass = config['stores_scom_pass']
+else
+  #  graceful_exit('unable to find ADW login config information')
+  puts 'No login file found'
+  log_out('no login file found...exiting')
+  exit 1
+end
+################################################################################################
+# Local Variables
+################################################################################################
+#!!!!! These variables need to be evaluated each time the script is created.
+@debug_script = false # This is to turn on/off DataDog uploads & print to screen (true = DD off & print to screen on)
+
+scom_warehouse_host1           = "<%= node['stores_dashboards']['scom_stores_opsdb1'] %>"
+scom_warehouse_host2           = "<%= node['stores_dashboards']['scom_stores_opsdb2'] %>"
+scom_warehouse_dbname          = "<%= node['stores_dashboards']['scom_stores_dbname']%>"
+scom_warehouse_tcpport         = "<%= node['stores_dashboards']['scom_stores_tcpport']%>"
+scom_warehouse_timeout         = "<%= node['stores_dashboards']['scom_stores_timeout']%>"
+integer_scom_warehouse_timeout = scom_warehouse_timeout.to_i
+
+################################################################################################
+# Functions/APIs
+################################################################################################
+##### API Setup to DataDog #####
+@dd = DataDogAPI.new("<%= node['toc_dashboards']['datadog_api_key'] %>",
+                     @log_file, 'scom_stores_url_monitor_logfile',
+                     "<%= node['toc_dashboards']['web_proxy_host'] %>",
+                     "<%= node['toc_dashboards']['web_proxy_port'] %>",
+                     "<%= node['toc_dashboards']['datadog_application_key'] %>")
+
+################################################################################################
+# Script Logic
+
+#TODO: check respsone function
+def check_history_and_event(servername, monitorname)
+  puts "CH Servername: #{servername}"
+  puts "CH monitorname: #{monitorname}"
+  bol_found_previous = false
+  log_out('Trying to determine if this server and url are a previously captured issue.')
+  @previous_svc_issues.each do |prev_svc|
+    puts "loop #{prev_svc}"
+    bol_found_previous = true if prev_svc == "#{servername},#{monitorname}"
+  end
+  return unless bol_found_previous == false
+  hashtags = ['stores_event_filter:stores_isp_url_health', 'stores_event_filter:stores_mobile_health_events', servername, monitorname]
+  dd_alert_text   = "error. Store's web service #{monitorname} at store #{servername} is in an unhealthy state."
+  dd_alert_type   = 'error'
+  dd_api_type     = 'event'
+  if @debug_script == true
+    puts '-------------------------------'
+    puts "Hashtags: #{hashtags}"
+    puts "Alert Name: #{@dd_alert_name}"
+    puts "Alert Title: #{@dd_alert_title}"
+    puts "Alert Type: #{dd_alert_type}"
+    puts "Alert Text: #{dd_alert_text}"
+    puts '################################'
+  else
+    #Submission to DataDog
+    @dd.alert_datadog(
+      hashtags,               # tag
+      "#{@dd_alert_name}",    # alert_name
+      "#{@dd_alert_title}",   # alert_title searched for in dd
+      "#{dd_alert_text}",     # alert_text
+      "#{dd_alert_type}",     # alert_type
+      "#{dd_api_type}",       # api type
+      '')                     # counter
+  end
+end
+
+# Log SQL execution time to DD
+def send_query_metrics_to_dd(svr_name, db_name, alert_title, query_run_time)
+  if @debug_script == true
+    puts svr_name
+    puts '***********************************'
+    puts 'SQL Metrics'
+    puts ["Server:#{svr_name}", "DB:#{db_name}", "Alert:#{alert_title}"]
+    puts "Query Runtime: #{query_run_time}"
+    puts '***********************************'
+  else
+    @dd.send_metric('scom_search_time', query_run_time, ["Server:#{svr_name}", "DB:#{db_name}", "Alert:#{alert_title}"])
+  end
+end
+
+def track_and_clear_svc_issues(isp_svc_issue)
+  # Store current list of AP issues into stateful file
+  puts "Previous SVC List: #{@previous_svc_issues}" if @debug_script == true
+  puts "Current SVC List: #{isp_svc_issue}" if @debug_script == true
+  File.open(@isp_svc_log, 'w+') do |f|
+    f.puts(isp_svc_issue)
+  end
+  #Send all Clear message to datadog when AP falls off the list
+  @previous_svc_issues.each do |prev_svc|
+    bol_found = false
+    @isp_svc_issue_tracker.each do |curr_svc|
+      if prev_svc == curr_svc
+        puts "Prev SVC: #{prev_svc}"
+        puts "Curr SVC: #{curr_svc}"
+        bol_found = true
+      end
+    end
+    puts "State of #{prev_svc}, Found? #{bol_found}"
+    puts '______________________________'
+    next unless bol_found == false
+    store_monitor = prev_svc.split(',')
+    hashtags = ['stores_event_filter:stores_isp_url_health', 'stores_event_filter:stores_mobile_health_events', store_monitor[0], store_monitor[1]]
+    dd_alert_text   = "recovered. Store's web service #{store_monitor[1]} at store #{store_monitor[0]} is in a healthy state."
+    dd_alert_type   = 'success'
+    dd_api_type     = 'event'
+    if @debug_script == true
+      puts '-------------------------------'
+      puts "Hashtags: #{hashtags}"
+      puts "Alert Name: #{@dd_alert_name}"
+      puts "Alert Title: #{@dd_alert_title}"
+      puts "Alert Type: #{dd_alert_type}"
+      puts "Alert Text: #{dd_alert_text}"
+      puts '################################'
+    else
+      #Submission to DataDog
+      @dd.alert_datadog(
+        hashtags,               # tag
+        "#{@dd_alert_name}",    # alert_name
+        "#{@dd_alert_title}",   # alert_title searched for in dd
+        "#{dd_alert_text}",     # alert_text
+        "#{dd_alert_type}",     # alert_type
+        "#{dd_api_type}",       # api type
+        '')                     # counter
+    end
+  end
+end
+
+def generate_output(final_list)
+  csv = []
+  final_list.each do |row|
+    servername = row['Path'].split('.')[0][0..4]
+    monitorname = row['MonitorName'].split('.')[7]
+    @isp_svc_issue_tracker.push(servername + ',' + monitorname) #Need to hold the info for stateful storage
+    csv << "#{servername},#{monitorname}"
+    check_history_and_event(servername, monitorname)
+  end
+end
+
+#SQL Query for URL events in SCOM
+sql = <<eos
+use OperationsManager
+--Health of Each Monitor - URL Monitor
+--Use the time factor for the event feed when Health State changes will post the error event to Datadog but when state changes back will post clear event
+SELECT bme.Path, mon.MonitorName, sv.MonitorId, sv.HealthState, sv.LastModified, mon.IsUnitMonitor, mon.MonitorEnabled, mon.ConfigurationXML, mon.MonitorCategory, mon.AlertOnState
+FROM dbo.StateView AS sv with (nolock)
+       INNER JOIN Monitor as mon with (nolock) on mon.MonitorId = sv.MonitorId
+       , BaseManagedEntity as bme with (nolock)
+WHERE sv.basemanagedentityid = bme.basemanagedentityid
+       AND sv.monitorid IN (SELECT MonitorId FROM Monitor with (nolock) where MonitorName like '%.svc')
+       --Removes unwanted URL Monitors
+AND sv.MonitorId NOT IN ('00E2081B-C728-8375-3AE9-AF4A27B0136E'
+,'A17C9083-CCBC-2AF1-3C51-20419F6D1E2E'
+,'B56D48A2-23DF-F5B0-42E5-D0796B3EDB71'
+,'C7931AA1-6221-DAD5-B3BF-147AEBFED32C'
+,'329E7308-30DF-818F-FD30-6FA7561FFD17'
+,'63EA9217-6DC1-E7F3-31B9-233A23C459ED'
+,'FD02DC8A-5E92-F9E0-C4B1-95AA414649A9'
+,'928FF0A1-C2B3-021B-C412-E617736E2FBE')
+AND IsUnitMonitor = 1
+AND HealthState IN (3)
+--Sets 10 minute interval(SCOM stores dates as UTC)
+AND sv.LastModified > dateadd(minute,-10,getutcdate())
+Order by sv.LastModified desc
+eos
+
+sql_run_start_time = Time.now.to_i
+
+begin
+  client_scom_str1 = TinyTds::Client.new(:username => scom_stores_warehouse_user,
+                                         :password => scom_stores_warehouse_pass,
+                                         :host => scom_warehouse_host1,
+                                         :database => scom_warehouse_dbname,
+                                         :port => scom_warehouse_tcpport,
+                                         :timeout => integer_scom_warehouse_timeout)
+
+  # Run DB query to get our results
+  result1 = client_scom_str1.execute(sql)
+
+rescue => e
+  log_out("ERROR:  connecting to SCOM: #{e}")
+  #log_out("NOTIFICATION:  Ending script execution...")
+  puts "ERROR:  connecting to SCOM: #{e}"
+  #puts "NOTIFICATION:  Ending script execution..."
+  if "<%=node['stores_dashboards']['post_to_datadog']%>" == true
+    @dd.alert_datadog('', 'scom_stores_url_event', "#{e}", "error connecting to SCOM database: #{e}", 'error', 'event', 0)
+  end
+end
+
+# Set end_time variable for query execution
+sql_run_end_time = Time.now.to_i
+sql_run_time = sql_run_end_time - sql_run_start_time
+
+#Send query runtime to DD and log
+send_query_metrics_to_dd(scom_warehouse_host1, scom_warehouse_dbname, @dd_alert_title, sql_run_time)
+log_out("STR1 SQL execution time: #{sql_run_time}")
+
+# Set start_time variable for STR2 query execution
+sql_run_start_time = Time.now.to_i
+
+begin
+  client_scom_str2 = TinyTds::Client.new(:username => scom_stores_warehouse_user,
+                                         :password => scom_stores_warehouse_pass,
+                                         :host => scom_warehouse_host2,
+                                         :database => scom_warehouse_dbname,
+                                         :port => scom_warehouse_tcpport,
+                                         :timeout => integer_scom_warehouse_timeout)
+  # Run DB query to get our results
+  result2 = client_scom_str2.execute(sql)
+
+rescue => e
+  log_out("ERROR:  connecting to SCOM: #{e}")
+  #log_out("NOTIFICATION:  Ending script execution...")
+  puts "ERROR:  connecting to SCOM: #{e}"
+  #puts "NOTIFICATION:  Ending script execution..."
+  if "<%=node['stores_dashboards']['post_to_datadog']%>" == true
+    @dd.alert_datadog('', 'scom_stores_url_event', "#{e}", "error connecting to SCOM database: #{e}", 'error', 'event', 0)
+  end
+end
+
+# Set end_time variable for query execution
+sql_run_end_time = Time.now.to_i
+sql_run_time = sql_run_end_time - sql_run_start_time
+
+#Send query runtime to DD and log
+send_query_metrics_to_dd(scom_warehouse_host2, scom_warehouse_dbname, @dd_alert_title, sql_run_time)
+log_out("STR2 SQL execution time: #{sql_run_time}")
+
+# Compile results
+result_total = result1.to_a + result2.to_a
+result_count = result_total.count
+
+puts "Total Count: #{result_total.count}"
+
+#Submission to DataDog
+@dd.send_metric("#{@dd_alert_title}", result_count, ['stores_event_filter:stores_isp_url_health', 'stores_event_filter:stores_mobile_health_events'])
+##########################################################
+# Data Flow
+##########################################################
+begin
+  @previous_svc_issues = []
+  log_out('Importing stateful data from logfile')
+  if File.exist?(@isp_svc_log)
+    puts 'Reading Previous Log'
+    f = File.open(@isp_svc_log, 'r')
+    f.each_line do |line|
+      @previous_svc_issues.push(line.chomp)
+    end
+    f.close
+    puts "isp svc log: #{@isp_svc_log}"
+    puts "previous svc issue: #{@previous_svc_issues}"
+    log_out('Deleting previous stateful tracking info')
+    File.delete(@isp_svc_log)
+  end
+rescue => e
+  log_out("Errored on handling stateful information : #{e}")
+end
+generate_output(result_total)
+track_and_clear_svc_issues(@isp_svc_issue_tracker)

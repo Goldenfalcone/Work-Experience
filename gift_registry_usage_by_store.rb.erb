@@ -1,0 +1,189 @@
+#!/opt/chef/embedded/bin/ruby
+################################################################################################
+# This script collects Gift registry usage counts and will be displayed on a DataDog Dashboard in an event feed
+#
+# Author: Jeremy Hill
+# Date: 10 NOV 2015
+################################################################################################
+################################################################################################
+require 'tiny_tds'
+require 'rubygems'
+require 'json'
+require 'open-uri'
+require 'net/http'
+require 'io/console'
+require 'openssl'
+require 'date'
+require 'logger'
+require 'yaml'
+require_relative '/opt/toc/common/datadog_api'
+require_relative '/opt/toc/common/splunk_search'
+require 'httparty'
+require 'time'
+require 'hashie'
+
+# Log Init ################################################
+@log_file = '/opt/toc/stores_scripts/logs/gift_registry_usage_by_store.log'
+@log = Logger.new(@log_file, 10, 1024000)
+@log.datetime_format = '%Y-%m-%d %H:%M:%S'
+@client_connected = false
+@usage_issue_tracker  = []
+@usage_issue_count    = 0
+@usage_issue_log      = '/opt/toc/stores_scripts/config/gift_registry_usage_by_store_log'
+@dd_alert_name  = 'Stores Gift Registry Usage Count'         # alert_name
+@dd_alert_title = 'Stores.gift.registry.usage.count'         # alert_title searched for in dd
+@splunk_server = "<%= node['stores_dashboards']['splunk_server'] %>"
+@splunk_port = "<%= node['stores_dashboards']['splunk_port'] %>"
+@splunk_app = "<%= node['stores_dashboards']['es_splunk_namespace'] %>"
+@debug_script = false # This is to turn on/off DataDog uploads & print to screen (true = DD off & print to screen on)
+##### API Setup to DataDog #####
+@dd = DataDogAPI.new("<%= node['toc_dashboards']['datadog_api_key'] %>",
+                     @log_file, 'gift_registry_usage_by_store_logfile',
+                     "<%= node['toc_dashboards']['web_proxy_host'] %>",
+                     "<%= node['toc_dashboards']['web_proxy_port'] %>",
+                     "<%= node['toc_dashboards']['datadog_application_key'] %>")
+################################################################################################
+# Function to log information #############################
+def log_out(entry)
+  @log.info(entry)
+end
+
+def check_history_and_event(storenumber, usage)
+  puts "CH storenumber: #{storenumber}"
+  puts "CH certcount: #{usage}"
+  bol_found_previous = false
+  log_out('Trying to determine if this store and usage are a previously captured issue.')
+  @previous_usage_issue.each do |prev_use|
+    puts "loop #{prev_use}"
+    bol_found_previous = true if prev_use == "#{storenumber},#{usage}"
+  end
+  return unless bol_found_previous == false
+  if @debug_script == true
+    puts '-------------------------------'
+    puts 'stores_gift_registry_usage'
+    puts 'Stores gift registry usage'
+    puts 'Stores.gift.registry.usage'
+    puts 'Error'
+    puts "Store number T#{storenumber} has not used Gift Registry in the past 12 hours!"
+    puts '################################'
+  else
+    #Submission to DataDog
+    @dd.alert_datadog(
+      'stores_gift_registry_usage',                           # tag
+      'Stores Gift registry usage',                            # alert_name
+      'Stores.gift.registry.usage',                            # alert_title searched for in dd
+      "Store number T#{storenumber} has not used Gift registry in the past 12 hours!",                             # alert_text
+      'Error',                                                   # alert_type
+      'event',                                                   # api type
+      '')                                           # counter
+  end
+end
+
+def track_and_clear_cert_issues(usage_issue)
+  # Store current list of Cert issues into stateful file
+  puts "Previous usage List: #{@previous_usage_issue}" if @debug_script == true
+  puts "Current usage List: #{usage_issue}" if @debug_script == true
+  File.open(@usage_issue_log, 'w+') do |f|
+    f.puts(usage_issue)
+  end
+  #Send all Clear message to datadog when Store and Cert count falls off the list
+  @previous_usage_issue.each do |prev_use|
+    bol_found = false
+    @usage_issue_tracker.each do |curr_use|
+      if prev_use == curr_use
+        puts "Prev Cert: #{prev_use}"
+        puts "Curr Cert: #{curr_use}"
+        bol_found = true
+      end
+    end
+    puts "State of #{prev_use}, Found? #{bol_found}"
+    puts '______________________________'
+    next unless bol_found == false
+    store_monitor = prev_use.split(',')
+    hashtags = ['stores_gift_registry_usage']
+    dd_alert_text   = "recovered. Store number T#{store_monitor[0]} has used Gift Registry in the past 12 hours!"
+    dd_alert_type   = 'success'
+    dd_api_type     = 'event'
+    if @debug_script == true
+      puts '-------------------------------'
+      puts "Hashtags: #{hashtags}"
+      puts "Alert Name: #{@dd_alert_name}"
+      puts "Alert Title: #{@dd_alert_title}"
+      puts "Alert Type: #{dd_alert_type}"
+      puts "Alert Text: #{dd_alert_text}"
+      puts '################################'
+    else
+      #Submission to DataDog
+      @dd.alert_datadog(
+        hashtags,               # tag
+        "#{@dd_alert_name}",    # alert_name
+        "#{@dd_alert_title}",   # alert_title searched for in dd
+        "#{dd_alert_text}",     # alert_text
+        "#{dd_alert_type}",     # alert_type
+        "#{dd_api_type}",       # api type
+        '')                     # counter
+    end
+  end
+end
+
+def generate_output(final_list)
+  csv = []
+  final_list.each do |detail|
+    storenumber = "#{detail['store_id']}"
+    usage = "#{detail['count(store_id)']}"
+    if detail['count(store_id)'] == 0
+      @usage_issue_count += 1
+      @usage_issue_tracker.push(storenumber + ',' + usage) #Need to hold the info for stateful storage
+      csv << "#{storenumber},#{usage}"
+      check_history_and_event(storenumber, usage)
+      puts "Count: #{@usage_issue_count}"
+    else
+      next
+    end
+  end
+end
+################################
+# Splunk Statistics
+################################
+
+def check_response(results_in)
+  #if the Splunk Search class returned an error
+  if results_in == 'error'
+    #error returned by splunk as a string, post to datadog and exit
+    log_out "Error returned from Splunk, exiting: #{results_in}"
+    exit 1
+  end
+end
+
+#create splunk connection
+splunk_init = SplunkSearch.new('<%= @login_file %>', @log_file)
+
+log_out('successfully created splunk instance')
+
+# Gift Registry Usage by store
+puts "\n"
+puts 'Starting: gift_registry_usage_count'
+splunk_results = splunk_init.splunk_search(@splunk_server, @splunk_port, 'stores_splunk_user', 'stores_splunk_pass', @splunk_app, 'Gift Registry Usage Count')
+check_response(splunk_results) # will exit if in error.
+begin
+           @previous_usage_issue = []
+           log_out('Importing stateful data from logfile')
+           if File.exist?(@usage_issue_log)
+             puts 'Reading Previous Log'
+             f = File.open(@usage_issue_log, 'r')
+             f.each_line do |line|
+               @previous_usage_issue.push(line.chomp)
+             end
+             f.close
+             puts "Usage issue log: #{@usage_issue_log}"
+             puts "previous usage issue: #{@previous_usage_issue}"
+             log_out('Deleting previous stateful tracking info')
+             File.delete(@usage_issue_log)
+           end
+         rescue => e
+           log_out("Errored on handling stateful information : #{e}")
+         end
+generate_output(splunk_results)
+track_and_clear_cert_issues(@usage_issue_tracker)
+
+@dd.send_metric('stores.gift.registry.usage.count', "#{@usage_issue_count}", '')
