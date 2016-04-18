@@ -43,9 +43,9 @@ def log_out(entry)
   @log.info(entry)
 end
 # Mywork iOS version from newrelic query
-response_osv = HTTParty.get('https://insights-api.newrelic.com/v1/accounts/892034/query?',
+response_osv = HTTParty.get('https://propriatary',
                             headers: { 'X-Query-Key' => "<%= node['toc_dashboards']['x_query_key'] %>" },
-                            query: 'nrql=SELECT%20uniquecount%28uuid%29%20from%20Mobile%20where%20appName%20%3D%27Stores%2emyWork%27%20facet%20osVersion',
+                            query: 'nrql=propriatary',
                             verify: false)
 
 #This splits the hash array for Facets
@@ -78,9 +78,9 @@ response.each do |detail|
   end
 end
 # MyWork App version from newrelic
-response_mwv = HTTParty.get('https://insights-api.newrelic.com/v1/accounts/892034/query?',
+response_mwv = HTTParty.get('https://propriatary',
                             headers: { 'X-Query-Key' => "<%= node['toc_dashboards']['x_query_key'] %>" },
-                            query: 'nrql=SELECT%20uniquecount%28uuid%29%20from%20Mobile%20where%20appName%20%3D%27Stores%2emyWork%27%20facet%20appVersion',
+                            query: 'nrql=propriatary',
                             verify: false)
 response = response_mwv.parsed_response['facets']
 response.each do |detail|
